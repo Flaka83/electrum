@@ -7,7 +7,8 @@ import math
 import time
 
 import attr
-import aiohttp
+
+import electrum_ecc as ecc
 from electrum_ecc import ECPrivkey
 
 from . import lnutil
@@ -210,6 +211,7 @@ class SwapManager(Logger):
         self.taskgroup = OldTaskGroup()
         asyncio.run_coroutine_threadsafe(self.main_loop(), self.network.asyncio_loop)
 
+    @log_exceptions
     async def main_loop(self):
         self.logger.info("starting taskgroup.")
         try:
@@ -882,27 +884,6 @@ class SwapManager(Logger):
         self.lockup_fee = self.get_fee(LOCKUP_FEE_SIZE)
         self.claim_fee = self.get_fee(CLAIM_FEE_SIZE)
 
-    async def get_pairs(self) -> None:
-        """Might raise SwapServerError."""
-        from .network import Network
-        try:
-            pairs = await self.send_request_to_server('getpairs', None)
-        except aiohttp.ClientError as e:
-            self.logger.error(f"Swap server errored: {e!r}")
-            raise SwapServerError() from e
-        # cache data to disk
-        with open(self.pairs_filename(), 'w', encoding='utf-8') as f:
-            f.write(json.dumps(pairs))
-        fees = pairs['pairs']['BTC/BTC']['fees']
-        self.percentage = fees['percentage']
-        self.normal_fee = fees['minerFees']['baseAsset']['normal']
-        self.lockup_fee = fees['minerFees']['baseAsset']['reverse']['lockup']
-        self.claim_fee = fees['minerFees']['baseAsset']['reverse']['claim']
-        limits = pairs['pairs']['BTC/BTC']['limits']
-        self._min_amount = limits['minimal']
-        self._max_amount = limits['maximal']
-        assert pairs.get('htlcFirst') is True
-
     def pairs_filename(self):
         return os.path.join(self.wallet.config.path, 'swap_pairs')
 
@@ -1158,7 +1139,31 @@ class SwapManager(Logger):
         return response
 
 
+import aiohttp
+
 class HttpSwapManager(SwapManager):
+
+    async def get_pairs(self) -> None:
+        """Might raise SwapServerError."""
+        from .network import Network
+        try:
+            pairs = await self.send_request_to_server('getpairs', None)
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Swap server errored: {e!r}")
+            raise SwapServerError() from e
+        # cache data to disk
+        with open(self.pairs_filename(), 'w', encoding='utf-8') as f:
+            f.write(json.dumps(pairs))
+        fees = pairs['pairs']['BTC/BTC']['fees']
+        self.percentage = fees['percentage']
+        self.normal_fee = fees['minerFees']['baseAsset']['normal']
+        self.lockup_fee = fees['minerFees']['baseAsset']['reverse']['lockup']
+        self.claim_fee = fees['minerFees']['baseAsset']['reverse']['claim']
+        limits = pairs['pairs']['BTC/BTC']['limits']
+        self._min_amount = limits['minimal']
+        self._max_amount = limits['maximal']
+        assert pairs.get('htlcFirst') is True
+
     async def send_request_to_server(self, method, request_data):
         response = await self.network.async_send_http_on_proxy(
             'post' if request_data else 'get',
@@ -1166,3 +1171,163 @@ class HttpSwapManager(SwapManager):
             json=request_data,
             timeout=30)
         return json.loads(response)
+
+
+
+# uses https://github.com/ecdsa/aionostr/tree/electrum_ecc_submodule
+import aionostr
+from aionostr.util import to_nip19
+from collections import defaultdict
+
+NOSTR_DM = 4
+NOSTR_SWAP_OFFER = 10943
+NOSTR_TIMEOUT = 600
+NOSTR_EVENT_VERSION = 1
+
+
+class NostrSwapManager(SwapManager):
+    # uses nostr:
+    #  - to advertise servers
+    #  - for client-server RPCs (using DMs)
+    #     (todo: we should use onion messages for that)
+
+    def __init__(self, *, wallet: 'Abstract_Wallet', lnworker: 'LNWallet', keypair):
+        SwapManager.__init__(self, wallet=wallet, lnworker=lnworker)
+        self.config = self.wallet.config
+        self.private_key = keypair.privkey
+        self.nostr_private_key = to_nip19('nsec', keypair.privkey.hex())
+        self.nostr_pubkey = keypair.pubkey.hex()[2:]
+        self.is_server = self.config.get('enable_plugin_swapserver', False)
+        self.dm_replies = defaultdict(asyncio.Future)  # type: Dict[bytes, asyncio.Future]
+        self.logger.info(f'nostr pubkey: {self.nostr_pubkey}')
+
+    @log_exceptions
+    async def main_loop(self):
+        self.logger.info("starting taskgroup.")
+        try:
+            async with self.taskgroup as group:
+                await group.spawn(self.pay_pending_invoices())
+                await group.spawn(self.check_direct_messages())
+                await group.spawn(self.publish_offer())
+                await group.spawn(self.get_pairs())
+        except Exception as e:
+            self.logger.exception("taskgroup died.")
+        finally:
+            self.logger.info("taskgroup stopped.")
+
+    @property
+    def relays(self):
+        relay = self.network.config.get('nostr_relay', 'wss://relay.damus.io')
+        return [relay]
+
+    async def get_pairs(self) -> None:
+        """Might raise SwapServerError."""
+        from .network import Network
+        offers = await self.fetch_offers()
+        if not offers:
+            print('no offers available')
+            return
+        # select the best offer
+        offer = offers[0]
+        print('best offer', offer)
+        # cache data to disk
+        with open(self.pairs_filename(), 'w', encoding='utf-8') as f:
+            f.write(json.dumps(offers))
+        self.percentage = offer['percentage_fee']
+        self.normal_fee = offer['normal_mining_fee']
+        self.lockup_fee = offer['reverse_mining_fee']
+        self.claim_fee = offer['claim_mining_fee']
+        self._min_amount = offer['min_amount']
+        self._max_amount = offer['max_amount']
+        self.server_pubkey = offer['pubkey']
+
+    async def fetch_offers(self):
+        self.logger.info(f'fetching swap offers from {self.relays}')
+        events = await aionostr.get_anything({"kinds": [NOSTR_SWAP_OFFER], "limit":10}, relays=self.relays)
+        result = []
+        for event in events:
+            content = json.loads(event.to_json_object()['content'])
+            content['pubkey'] = event.pubkey
+            version = content.get('version', 0)
+            if version == NOSTR_EVENT_VERSION:
+                result.append(content)
+        return result
+
+    async def publish_offer(self):
+        if not self.is_server:
+            return
+        self.init_pairs()
+        offer = {
+            "type": "electrum-swap",
+            "version": NOSTR_EVENT_VERSION,
+            "timeout": int(time.time()) + NOSTR_TIMEOUT,
+            'percentage_fee': self.percentage,
+            'normal_mining_fee': self.normal_fee,
+            'reverse_mining_fee': self.lockup_fee,
+            'claim_mining_fee': self.claim_fee,
+            'min_amount': self._min_amount,
+            'max_amount': self._max_amount,
+        }
+        print(f'publishing swap offer {offer}')
+        await aionostr.add_event(
+            self.relays,
+            kind=NOSTR_SWAP_OFFER,
+            content=json.dumps(offer),
+            private_key=self.nostr_private_key)
+
+    async def send_direct_message(self, pubkey: str, content: str) -> str:
+        event_id = await aionostr.add_event(
+            self.relays,
+            kind=NOSTR_DM,
+            content=content,
+            private_key=self.nostr_private_key,
+            direct_message=pubkey)
+        return event_id
+
+    async def send_request_to_server(self, method: str, request: dict) -> dict:
+        request['method'] = method
+        event_id = await self.send_direct_message(self.server_pubkey, json.dumps(request))
+        response = await self.dm_replies[event_id]
+        return response
+
+    async def check_direct_messages(self):
+        privkey = aionostr.key.PrivateKey(self.private_key)
+        queue = await aionostr.get_anything(
+            {"kinds": [NOSTR_DM], "limit":1, "#p": [self.nostr_pubkey]},
+            relays=self.relays,
+            private_key=self.nostr_private_key,
+            stream=True
+        )
+        while True:
+            event = await queue.get()
+            try:
+                content = privkey.decrypt_message(event.content, event.pubkey)
+                content = json.loads(content)
+            except Exception:
+                continue
+            content['event_id'] = event.id
+            content['event_pubkey'] = event.pubkey
+            if 'reply_to' in content:
+                self.dm_replies[content['reply_to']].set_result(content)
+            elif 'method' in content:
+                await self.handle_request(content)
+            else:
+                print('unknown message', content)
+
+    async def handle_request(self, request):
+        # todo: remember event_id of already processed requests
+        method = request.pop('method')
+        event_id = request.pop('event_id')
+        event_pubkey = request.pop('event_pubkey')
+        self.logger.info(f'handle_request: id={event_id} {method}')
+        if method == 'addswapinvoice':
+            r = self.server_add_swap_invoice(request)
+        elif method == 'createswap':
+            r = self.server_create_swap(request)
+        elif method == 'createnormalswap':
+            r = self.server_create_normal_swap(request)
+        else:
+            raise Exception(method)
+        r['reply_to'] = event_id
+        self.logger.info(f'sending response id={event_id}')
+        await self.send_direct_message(event_pubkey, json.dumps(r))

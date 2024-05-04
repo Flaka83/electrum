@@ -83,7 +83,7 @@ from .lnutil import ImportedChannelBackupStorage, OnchainChannelBackupStorage
 from .lnchannel import ChannelBackup
 from .channel_db import UpdateStatus, ChannelDBNotLoaded
 from .channel_db import get_mychannel_info, get_mychannel_policy
-from .submarine_swaps import HttpSwapManager
+from .submarine_swaps import HttpSwapManager, NostrSwapManager
 from .channel_db import ChannelInfo, Policy
 from .mpp_split import suggest_splits, SplitConfigRating
 from .trampoline import create_trampoline_route_and_onion, is_legacy_relay
@@ -866,8 +866,13 @@ class LNWallet(LNWorker):
         # payment_hash -> callback:
         self.hold_invoice_callbacks = {}                # type: Dict[bytes, Callable[[bytes], Awaitable[None]]]
         self.payment_bundles = []                       # lists of hashes. todo:persist
-        self.swap_manager = HttpSwapManager(wallet=self.wallet, lnworker=self)
 
+        # server: should support both transports
+        if self.config.SWAPS_OVER_NOSTR:
+            nostr_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NOSTR_KEY)
+            self.swap_manager = NostrSwapManager(wallet=self.wallet, lnworker=self, keypair=nostr_keypair)
+        else:
+            self.swap_manager = HttpSwapManager(wallet=self.wallet, lnworker=self)
 
     def has_deterministic_node_id(self) -> bool:
         return bool(self.db.get('lightning_xprv'))
