@@ -104,15 +104,15 @@ class Plugins(DaemonThread):
         return name in self.installed_plugin_metadata
 
     def can_be_upgraded(self, name):
-        from packaging.version import Version
+        from .util import versiontuple
         from .version import ELECTRUM_VERSION
         if name not in self.external_plugin_metadata:
             return False
         installed_version = self.installed_plugin_metadata[name].get('version')
         available_version = self.external_plugin_metadata[name].get('version')
         min_electrum_version = self.external_plugin_metadata[name].get('min_electrum_version', '0.0.0')
-        return Version(min_electrum_version) <= Version(ELECTRUM_VERSION)\
-            and Version(installed_version) < Version(available_version)
+        return versiontuple(min_electrum_version) <= versiontuple(ELECTRUM_VERSION)\
+            and versiontuple(installed_version) < versiontuple(available_version)
 
     def find_internal_plugins(self) -> Mapping[str, dict]:
         """Populates self.internal_plugin_metadata
